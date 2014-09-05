@@ -15,8 +15,8 @@ end
 $client_handler = ->(client) do
   Thread.new do
     while (log_line = client.readline)
-      $log_file_mutex.synchronize { $log_file.write log_line }
-      $line_count_mutex.synchronize { ($line_count += 1) > $line_count_limit ? $reset.call : nil }
+      $log_file_mutex.synchronize {$log_file.write log_line}
+      $line_count_mutex.synchronize {($line_count += 1) > $line_count_limit ? $reset.call : nil}
     end
   end
 end
