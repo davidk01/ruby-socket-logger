@@ -2,17 +2,12 @@
 require 'socket'
 
 # Global variables (mostly because I'm lazy and it makes the code easier)
-$line_count_limit = 1000
-$line_count, $log_file = 0, open('/tmp/log' + Time.now.to_s.gsub(' ', '_'), 'a')
-$line_count_mutex, $log_file_mutex = Mutex.new, Mutex.new
+$line_count_limit, $line_count_mutex, $log_file_mutex = 1000, Mutex.new, Mutex.new
+$log_file, $line_count = open('/tmp/log' + Time.now.to_s.gsub(' ', '_'), 'a'), 0
 
 # Reset the line count and re-open the file
-$reset = ->() do
-  $log_file_mutex.synchronize do
-    $line_count = 0
-    $log_file.close
-    $log_file = open('/tmp/log' + Time.now.to_s.gsub(' ', '_'), 'a')
-  end
+$reset = ->(n = '/tmp/log' + Time.now.to_s.gsub(' ', '_')) do
+  $log_file_mutex.synchronize {$line_count = 0; $log_file.reopen(n, 'a')}
 end
 
 # Read if the client is still sending data and write it to the log file.
@@ -27,6 +22,4 @@ $client_handler = ->(client) do
 end
 
 # Start the server
-UNIXServer.open('/tmp/logger') do |server|
-  loop { $client_handler.call(server.accept) }
-end
+UNIXServer.open('/tmp/logger') {|s| loop {$client_handler.call(s.accept)}}
