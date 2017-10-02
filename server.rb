@@ -1,25 +1,69 @@
 #!/usr/bin/env ruby
 require 'socket'
+require 'fileutils'
+require_relative './constants'
 
-$line_count_limit, $line_count_mutex, $log_file_mutex = 1000, Mutex.new, Mutex.new
-$log_file, $line_count = open('/tmp/log' + Time.now.to_s.gsub(' ', '_'), 'a'), 0
+# Where we synchronize the state of the various clients
+class LoggerState
+  # A mutex and the state of the initial file
+  def initialize
+    @mutex, @line_count = Mutex.new, 0
+    @log_file = open(LOG_PREFIX + Time.now.to_s.tr(' ', '_').tr(':', '_'), 'a')
+  end
 
-# Reset the line count and re-open the file.
-$reset = ->(n = '/tmp/log' + Time.now.to_s.gsub(' ', '_')) do
-  $log_file_mutex.synchronize {$line_count = 0; $log_file.reopen(n, 'a')}
-end
+  # Re-open the file and reset the counter. Make sure to acquire the mutex
+  def reset!
+    return unless reset?
+    @log_file.reopen(LOG_PREFIX + Time.now.to_s.tr(' ', '_').tr(':', '_'), 'a')
+    @line_count = 0
+  end
 
-# When we reach the line count limit re-open the log file and reset the counter.
-$client_handler = ->(client) do
-  Thread.new do
-    while (log_line = client.readline)
-      $log_file_mutex.synchronize {$log_file.write log_line}
-      $line_count_mutex.synchronize {($line_count += 1) > $line_count_limit ? $reset.call : nil}
+  # Do we need to reset?
+  def reset?
+    @line_count > LINE_COUNT_LIMIT
+  end
+
+  # Write the line and reset if we are over the line limit
+  def write!(line)
+    @mutex.synchronize do
+      @log_file.write(line)
+      @line_count += 1
+      reset!
+    end
+  end
+
+  # Fire a thread to handle the client
+  def handle_client(client)
+    Thread.new do
+      while (log_line = client.readline)
+        write!(log_line)
+      end
     end
   end
 end
 
-# Daemonize, drop a pidfile, and start the server.
-Process.daemon(true)
-open('ruby-logger.pid', 'w') {|f| f.puts Process.pid}
-UNIXServer.open('/var/run/logger.sock') {|s| loop {$client_handler[s.accept]}}
+begin
+  # Daemonize
+  Process.daemon(true)
+  # If the socket file exists then we assume another server is running
+  if File.exist?(DOMAIN_SOCKET)
+    raise StandardError, "Socket file exists so assuming another server is running"
+  end
+  # Initial state
+  state = LoggerState.new
+  # Write the PID to a file
+  open(PID_FILE, 'w') { |f| f.write Process.pid.to_s }
+  # Start the server to accept clients
+  UNIXServer.open(DOMAIN_SOCKET) do |s|
+    # Trap termination signal and shutdown the socket
+    Signal.trap("TERM") {
+      s.shutdown(SHUTDOWN_MODE)
+      FileUtils.rm_f(DOMAIN_SOCKET)
+    }
+    # This should throw an exception and terminate the loop when we get TERM signal
+    loop { state.handle_client(s.accept) }
+  end
+rescue StandardError => e
+  # If there are any exceptions then write them to a file
+  open(ERROR_FILE, 'w') { |f| f.puts "#{e.class}: #{e}" }
+end
