@@ -148,8 +148,10 @@ rescue StandardError => e
   # termination signal
   Thread.list.each { |t| t[:stop] = true }
   # See if we have any live threads and sleep some amount of time to give the
-  # termination signal time to propagate
-  sleep 1 if Thread.list.any?(&:alive?)
+  # termination signal time to propagate. Make sure to not wait on the main
+  # thread
+  all_threads = Thread.list.reject { |t| t == Thread.current }
+  sleep 1 if all_threads.any?(&:alive?)
   # At this point we should not have any more clients so we can flush and close
   # the log file
   state.flush
