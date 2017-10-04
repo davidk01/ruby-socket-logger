@@ -142,7 +142,7 @@ begin
   end
 rescue StandardError => e
   # If there are any exceptions then write it to a file. This also includes
-  # getting a term signal and shutting down the unix domain socket server
+  # getting TERM signal and shutting down the unix domain socket server
   open(ERROR_FILE, 'a') { |f| f.puts "#{e.class}: #{e}" }
   # Assuming we are no longer acception any client connections so send the client
   # termination signal
