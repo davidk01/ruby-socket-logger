@@ -1,7 +1,7 @@
 require 'socket'
-require_relative './constants'
+require_relative './server'
 
-log_socket = UNIXSocket.new(DOMAIN_SOCKET)
+log_socket = UNIXSocket.new(LoggerState::DOMAIN_SOCKET)
 sleep 1
 5000.times do
   begin

@@ -13,7 +13,7 @@ rm -f ruby-logger.error
 # Remove the server socket so we can start another server
 rm -f ruby-logger.sock
 # Start the server
-./server.rb
+ruby -r ./server.rb -e 'LoggerState.start_server_loop(daemonize: true)'
 # Start some concurrent clients in the background
 clients="40"
 for i in $(seq 1 "${clients}"); do (ruby client.rb &> /dev/null &); done
