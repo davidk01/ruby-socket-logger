@@ -14,39 +14,43 @@ class LoggerState
     @r, @w = IO.pipe
     # Initial log file
     @log_file = open(log_string, 'a')
-    # Thread for counting the lines and rotating the log file
-    @monitoring_thread = Thread.new { monitoring_loop }
     # We are not initially stopped and can process client requests
     @stop = false
-    # The symbol we use to mark threads belonging to the logging server
-    @marker = :logger
+    # The symbol we use to mark threads belonging to the logging server. This
+    # is unique per instance so we can in theory have multiple logger instances
+    # and shut down each one without messing with the threads of the other
+    @marker = object_id.to_s.to_sym
     # Name for the monitoring thread
-    @monitoring_name = :monitor
+    @monitoring_name = "monitor-#{@marker}".to_sym
     # Name for the client handlers
-    @handler_name = :handler
+    @handler_name = "handler-#{@marker}".to_sym
+    # Thread for counting the lines and rotating the log file
+    @monitoring_thread = Thread.new { monitoring_loop }
   end
 
-  # Find all the threads belonging to the logging server
+  # Find all the threads belonging to this instance of the logging server
   def logging_threads
     Thread.list.select { |t| t[@marker] }
   end
 
   # Mark the current thread as a logging thread so that when we are shutting
   # down the server we can try to do it gracefully by finding the threads we
-  # spawned and then asking them to shut down by setting another thread local
-  # variable
+  # spawned and then asking them to shut down or killing them if they take
+  # a long time
   def mark(name: nil)
     Thread.current[@marker] = true
     # We can name the threads as well for easier debugging
     Thread.current[:name] = name if name
   end
 
-  # When the server is shutting down the stop variable will be set
+  # When the server is shutting down we set this variable to true so that
+  # threads belonging to this logger can check it and start their shutdown
+  # sequence
   def stopped?
     @stop
   end
 
-  # We are shutting down so we set '@stop' so that active threads can check
+  # We are shutting down so we set '@stop'. Active threads will check
   # and start their own shut down process
   def stop!
     @stop = true
@@ -60,11 +64,11 @@ class LoggerState
     line_count = 0
     # An infinite loop for reading from the in-process pipe
     loop do
-      # If :stop thread local variable is set then we terminate the loop. This
-      # is used for somewhat graceful termination of the server
+      # Stop counting things if we are shutting down
       return if stopped?
       begin
-        # We read in a non-blocking manner
+        # We read in a non-blocking manner but not for any particular reason.
+        # We could also read in a blocking manner without any issues (I think)
         bytes = @r.read_nonblock(1_000)
         # However many bytes we read that's how many lines we add to the counter
         line_count += bytes.length
@@ -72,12 +76,14 @@ class LoggerState
         if line_count > LINE_COUNT_LIMIT
           @mutex.synchronize do
             rotate
-            # Reset the counter
             line_count = 0
           end
         end
       rescue IO::WaitReadable
-        # Wait for the pipe to be readable again
+        # Wait for the pipe to be readable again but time out after 1 second
+        # so that we can go back to the top of the loop and terminate if we
+        # are stopping. Otherwise we get stuck in a sleep here and have to
+        # wait 10 seconds to get killed
         IO.select([@r], [], [], 1)
       end
     end
@@ -89,33 +95,33 @@ class LoggerState
   end
 
   # When we open or rotate log segments we need a properly formatted
-  # file path. This method gives us that string based on the current
-  # time stamp
+  # file path string. This gives us that string
   def log_string
     LOG_PREFIX + time_string
   end
 
   # Rotate the log file. We flush and close just to make sure everything gets
-  # written to disk
+  # written to disk. This is not safe to do without acquiring a lock so make
+  # sure to acquire a lock before calling rotate
   def rotate
     flush
     close
     reopen
   end
 
-  # Flush everything to disk
+  # Flush everything to disk. Not safe if the lock is not acquired
   def flush
     @log_file.flush
   end
 
-  # Close the log file
+  # Close the log file. Same as above, not safe without lock
   def close
     @log_file.close
   end
 
   # Re-open the file with a new timestamp. Note that if we write quickly enough
   # it is possible we will re-open the same file but in practice this is not
-  # such a big deal
+  # such a big deal. Not safe if done without acquiring the lock
   def reopen
     @log_file.reopen(log_string, 'a')
   end
@@ -130,9 +136,7 @@ class LoggerState
   # if necessary
   def write!(log_bytes)
     # Acquire the mutex and write some bytes to the log file
-    @mutex.synchronize do
-      @log_file.write(log_bytes)
-    end
+    @mutex.synchronize { @log_file.write(log_bytes) }
     # This needs to be outside the mutex because we can get into a deadlock if
     # the write is inside the synchronized block. Hint: think about what
     # happens when '@w.write' blocks while we still have the lock
@@ -143,7 +147,7 @@ class LoggerState
     @w.write(LINE_COUNTER_INDICATOR * line_count) if line_count > 0
   end
 
-  # Fire a thread to handle the client that wants to log some lines
+  # Start a thread to handle the client that wants to log some lines
   def handle_client(client)
     Thread.new do
       # Mark it as a monitoring thread so we can iterate through the active
@@ -164,8 +168,8 @@ class LoggerState
       rescue StandardError => e
         # Something bad happend or client just went away
         log_error("Client error: #{e}")
-        # Just flush and tell the client to go away. This is not very
-        # graceful but good enough for now
+        # Just flush and tell the client to go away. This is not very nice
+        # from the clients perspective but good enough for now
         flush
         client.close
       end
@@ -174,7 +178,7 @@ class LoggerState
 
   # The logging server loop
   def self.start_server_loop(daemonize: false)
-    # Daemonize. We will run in the background if requested. Otherwise foreground
+    # We will run in the background if requested. Otherwise foreground
     Process.daemon(true) if daemonize
     # If the socket file exists then we assume another server is running and bail
     if File.exist?(DOMAIN_SOCKET)
@@ -182,9 +186,9 @@ class LoggerState
     end
     # Initialize the logger
     state = new
-    # Write our PID to a file so someone can send us a TERM signal
+    # Write our PID to a file so others can send us signals
     open(PID_FILE, 'w') { |f| f.write Process.pid.to_s }
-    # Start the unix domain socket server to accept clients
+    # Start the domain socket server to accept clients
     UNIXServer.open(DOMAIN_SOCKET) do |s|
       # Trap TERM signal and shut down the server. If there are clients that
       # are still trying to write then we try to nicely to tell them to go away
@@ -200,16 +204,14 @@ class LoggerState
     end
   rescue StandardError => e
     # If there are any exceptions then write it to a file. This also includes
-    # getting TERM signal and shutting down the unix domain socket server
+    # getting TERM signal and shutting down the server
     state.log_error("#{e.class}: #{e}")
-    # We are no longer accepting any client connections so set the stop criteria
-    # so that any logging threads will start their shut down sequence
+    # We are no longer accepting any client connections so set the stop criterion
+    # to tell any logging threads belong to this logger to terminate
     state.stop!
-    # See if we have any live threads and sleep some amount of time to give the
-    # termination signal time to propagate. Make sure to not wait on the main
-    # thread
+    # Give the logging threads belonging to this instance some time to terminate
     logging_threads = state.logging_threads
-    # Wait for up to 10 seconds for the monitoring threads to gracefully stop
+    # Wait for up to 10 seconds for termination
     10.times do |i|
       break unless logging_threads.any?(&:alive?)
       state.log_error("There are still active logging threads: #{i}-th try")
@@ -219,7 +221,8 @@ class LoggerState
     # should be a no-op
     logging_threads.each(&:kill)
     # At this point we should not have any more clients so we can flush and close
-    # the log file
+    # the log file. We probably should acquire a mutex but everything should be
+    # stopped at this point
     state.flush
     state.close
   end
