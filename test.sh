@@ -8,8 +8,6 @@ set -x
 rm -f ruby-log2017* &> /dev/null
 # Remove the PID file
 rm -f ruby-logger.pid
-# Dump any errors so we can see if anything interesting happened
-cat ruby-logger.error || true
 # Remove the error log
 rm -f ruby-logger.error
 # Remove the server socket so we can start another server
@@ -18,6 +16,7 @@ rm -f ruby-logger.sock
 ./server.rb
 # Start some concurrent clients in the background
 clients="40"
-for i in $(seq 1 "${clients}"); do (ruby client.rb &); done
-sleep 1
+for i in $(seq 1 "${clients}"); do (ruby client.rb &> /dev/null &); done
+# Sleep some amount of time and then send the termination signal
+sleep 4
 (kill -TERM $(cat ruby-logger.pid))
