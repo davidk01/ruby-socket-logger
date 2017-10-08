@@ -1,12 +1,15 @@
 require 'socket'
-require_relative './server'
+require_relative './logger'
 
-log_socket = UNIXSocket.new(LoggerState::DOMAIN_SOCKET)
-sleep 1
+client = LoggerClient.new(server: LoggerServer::DOMAIN_SOCKET)
+socket = UNIXSocket.new(LoggerServer::DOMAIN_SOCKET)
 5000.times do
   begin
-    log_socket.puts "some data"
+    # socket.puts "some data"
+    client.write_line "some data"
   rescue StandardError => e
-    STDERR.puts "Client writing error: #{e}"
+    STDERR.puts "Server error: #{e.class}: #{e}"
+    break
   end
 end
+client.done!

@@ -6,17 +6,16 @@ set -x
 (kill -TERM $(cat ruby-logger.pid)) || true
 # Clean up any written logs
 rm -f ruby-log2017* &> /dev/null
-# Remove the PID file
-rm -f ruby-logger.pid
-# Remove the error log
-rm -f ruby-logger.error
-# Remove the server socket so we can start another server
-rm -f ruby-logger.sock
 # Start the server
-ruby -r ./server.rb -e 'LoggerState.start_server_loop(daemonize: true)'
+ruby -r ./logger.rb -e 'LoggerServer.start_server_loop(daemonize: true)'
 # Start some concurrent clients in the background
-clients="40"
-for i in $(seq 1 "${clients}"); do (ruby client.rb &> /dev/null &); done
+clients="5"
+rm -f client.log* &> /dev/null
+for i in $(seq 1 "${clients}"); do (ruby client.rb &> "client.log.${i}" &); done
 # Sleep some amount of time and then send the termination signal
 sleep 4
 (kill -TERM $(cat ruby-logger.pid))
+# Wait for background jobs to finish
+for j in $(jobs -p); do
+  wait $j
+done

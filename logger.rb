@@ -1,16 +1,16 @@
 #!/usr/bin/env ruby
 %w[socket fileutils time].each { |r| require r }
 
-# Where we synchronize the state of the various clients
-class LoggerState
+# All the code for the logging server
+class LoggerServer
   # Where do we drop the pid file for the server
-  PID_FILE = File.join(__dir__, 'ruby-logger.pid').freeze
-  # Where do write errors
-  ERROR_FILE = File.join(__dir__, 'ruby-logger.error').freeze
+  PID_FILE = File.join(starting_dir = Dir.pwd, 'ruby-logger.pid').freeze
+  # Where do we write errors. Must be careful and rotate this as well
+  ERROR_FILE = File.join(starting_dir, 'ruby-logger.error').freeze
   # Where should clients connect to
-  DOMAIN_SOCKET = File.join(__dir__, 'ruby-logger.sock').freeze
+  DOMAIN_SOCKET = File.join(starting_dir, 'ruby-logger.sock').freeze
   # Folder plus the initial part of the log file
-  LOG_PREFIX = File.join(__dir__, 'ruby-log').freeze
+  LOG_PREFIX = File.join(starting_dir, 'ruby-log').freeze
   # How many lines (approximately) in a log file before we rotate it
   LINE_COUNT_LIMIT = 10_000
   # When we shut down the unix domain server we need a mode of shutdown
@@ -19,6 +19,9 @@ class LoggerState
   LINE_COUNTER_INDICATOR = '0'.freeze
   # The time stamp we add to the log files the server writes to
   TIME_FORMAT_STRING = '%Y-%j-%H-%M-%S-%N'.freeze
+  # Number of active clients we are willing to deal with before we turn
+  # away new clients
+  CLIENT_LIMIT = 50
 
   # A mutex, a pipe, a monitoring thread, and the state of the initial file
   def initialize
@@ -46,7 +49,7 @@ class LoggerState
 
   # Find all the threads belonging to this instance of the logging server
   def logging_threads
-    Thread.list.select { |t| t[@marker] }
+    Thread.list.select { |t| t[@marker] }.select(&:alive?)
   end
 
   # Mark the current thread as a logging thread so that when we are shutting
@@ -106,14 +109,24 @@ class LoggerState
   end
 
   # The current time formatted as we expect
-  def time_string
+  def self.time_string
     DateTime.now.strftime(TIME_FORMAT_STRING)
+  end
+
+  # Delegate to class method
+  def time_string
+    self.class.time_string
   end
 
   # When we open or rotate log segments we need a properly formatted
   # file path string. This gives us that string
-  def log_string
+  def self.log_string
     LOG_PREFIX + time_string
+  end
+
+  # Delegate to class method
+  def log_string
+    self.class.log_string
   end
 
   # Rotate the log file. We flush and close just to make sure everything gets
@@ -142,9 +155,25 @@ class LoggerState
     @log_file.reopen(log_string, 'a')
   end
 
-  # Logs errors to an error file
+  # Logs errors to an error file. We truncate the file when we go over
+  # the block size limit. Errors should be rare and so the truncation should
+  # not be a problem. This keeps the error file bounded.
+  def self.log_error(error)
+    line = "#{time_string}: #{error}"
+    open(ERROR_FILE, 'a') { |l| l.puts line }
+    stats = File.stat(ERROR_FILE)
+    if stats.size > 2 * stats.blksize # rubocop:disable Style/GuardClause
+      f = open(ERROR_FILE, 'w')
+      f.truncate(0)
+      f.close
+      # We lose the last write when we truncate so we have to do it again
+      open(ERROR_FILE, 'a') { |l| l.puts line }
+    end
+  end
+
+  # Instance method that delegates to class method
   def log_error(error)
-    open(ERROR_FILE, 'a') { |f| f.puts error.to_s }
+    self.class.log_error(error)
   end
 
   # Write the line or bytes and then send the count of the number of newline
@@ -152,10 +181,14 @@ class LoggerState
   # if necessary
   def write!(log_bytes)
     # Acquire the mutex and write some bytes to the log file
-    @mutex.synchronize { @log_file.write(log_bytes) }
+    @mutex.synchronize {
+      @log_file.write(log_bytes)
+    }
     # This needs to be outside the mutex because we can get into a deadlock if
     # the write is inside the synchronized block. Hint: think about what
-    # happens when '@w.write' blocks while we still have the lock
+    # happens when '@w.write' blocks while we still have the lock. But this
+    # means due to vagaries of thread scheduling we might get into a situation
+    # where we don't increment the counter quickly enough and overflow
     line_count = log_bytes.scan("\n").length
     # If we had any newline characters then we ship that many '0' bytes to the
     # monitoring thread so that it can increment its internal counter and decide
@@ -176,14 +209,19 @@ class LoggerState
           # down so tell the client to go away. We raise an exception and let
           # the exception handling logic do its thing
           raise StandardError, "Shutting down" if stopped?
-          # Get a line
+          # There is an interesting failure mode here. What happens if the clients
+          # are slow and start stacking up? At some point we will just come to a
+          # screeching halt. One way out of this conundrum is to limit how many
+          # clients we can deal with at a time and turn away new ones when we
+          # reach a certain number of active clients. This is the solution we
+          # implement in the server loop. We turn away clients when they go
+          # over a limit
           log_bytes = client.readline
-          # Write it to the log
           write!(log_bytes)
         end
       rescue StandardError => e
         # Something bad happend or client just went away
-        log_error("Client error: #{e}")
+        log_error("Client error: #{e.class}: #{e}")
         # Just flush and tell the client to go away. This is not very nice
         # from the clients perspective but good enough for now
         flush
@@ -204,42 +242,91 @@ class LoggerState
     state = new
     # Write our PID to a file so others can send us signals
     open(PID_FILE, 'w') { |f| f.write Process.pid.to_s }
+    # Track the number of active clients
+    client_count = 0
     # Start the domain socket server to accept clients
     UNIXServer.open(DOMAIN_SOCKET) do |s|
       # Trap TERM signal and shut down the server. If there are clients that
       # are still trying to write then we try to nicely to tell them to go away
-      # by sending the shutdown signal to the client handlers
       Signal.trap("TERM") {
+        state.stop!
         s.shutdown(SHUTDOWN_MODE)
-        FileUtils.rm_f(DOMAIN_SOCKET)
       }
       # This is the acceptance and client processing loop but when we get a TERM
       # signal we terminate the server so 's.accept' will throw an exception and
-      # terminate the loop
-      loop { state.handle_client(s.accept) }
+      # terminate the loop. We also keep track of the number of clients and terminate
+      # new clients when we are over the limit of the number of threads we are
+      # willing to handle.
+      loop {
+        state.handle_client(client = s.accept)
+        client_count += 1
+        next unless client_count > CLIENT_LIMIT
+        # This count is inaccurate because there is a race condition between
+        # starting the threads and when they get marked. So if enough clients
+        # connect quickly enough then we can overflow our limit and erroneously
+        # accept more clients. Only way I can think of to keep a true count is to use
+        # atomic counter to increment and decrement the counter when threads start
+        # and when they finish
+        client_count = state.logging_threads.length
+        if client_count > CLIENT_LIMIT
+          client.close
+          state.log_error("Throttling clients: #{client_count} > #{CLIENT_LIMIT}")
+        end
+      }
     end
   rescue StandardError => e
-    # If there are any exceptions then write it to a file. This also includes
-    # getting TERM signal and shutting down the server
-    state.log_error("#{e.class}: #{e}")
     # We are no longer accepting any client connections so set the stop criterion
-    # to tell any logging threads belong to this logger to terminate
+    # to tell any logging threads that belong to this logger to terminate. We also
+    # set this when handling TERM signal
     state.stop!
+    # Log the exception to a file so we can know what happened
+    state.log_error("#{e.class}: #{e}")
     # Give the logging threads belonging to this instance some time to terminate
     logging_threads = state.logging_threads
     # Wait for up to 10 seconds for termination
     10.times do |i|
-      break unless logging_threads.any?(&:alive?)
+      break unless logging_threads.any?
       state.log_error("There are still active logging threads: #{i}-th try")
       sleep 1
     end
     # We waited 10 seconds so now try to stop them ungracefully. In theory this
     # should be a no-op
     logging_threads.each(&:kill)
+  ensure
     # At this point we should not have any more clients so we can flush and close
     # the log file. We probably should acquire a mutex but everything should be
-    # stopped at this point
+    # stopped at this point so we are willing to let any active clients to disconnect
+    # ungracefully
     state.flush
     state.close
+    FileUtils.rm_f(DOMAIN_SOCKET)
+  end
+end
+
+# All the code for the logging client
+class LoggerClient
+  # We need to know what socket we will connect to
+  def initialize(server:)
+    # Connect to server
+    @socket = UNIXSocket.new(server)
+    # In case we are used in a multi-threaded context we need to only have
+    # one instnace of a given logger writing to the socket
+    @mutex = Mutex.new
+  end
+
+  # Write a line to the logging server. Newline will be appended
+  def write_line(bytes)
+    @mutex.synchronize { @socket.puts bytes }
+  rescue StandardError => e
+    STDERR.puts "#{LoggerServer.time_string}: ERROR: Could not write to server: #{e.class}: #{e}"
+  end
+
+  # When we are done with the logger we wait for writes to finish and close
+  # the server socket
+  def done!
+    @mutex.synchronize {
+      @socket.flush
+      @socket.close
+    }
   end
 end
