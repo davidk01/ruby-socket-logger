@@ -7,7 +7,7 @@ set -x
 # Clean up any written logs
 rm -f ruby-log2017* &> /dev/null
 # Start the server
-ruby -r ./logger.rb -e 'LoggerServer.start_server_loop(daemonize: true)'
+ruby -r ./logger -e 'LoggerServer.start_server_loop(daemonize: true)'
 # Start some concurrent clients in the background
 clients="5"
 rm -f client.log* &> /dev/null
